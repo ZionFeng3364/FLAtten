@@ -24,7 +24,7 @@ class Server(fedbase.BasicServer):
         # 为每个融合层创建独立的优化器
         # 也可以创建一个优化器管理所有参数，但独立管理更清晰
         self.fusion_optimizers = {
-            ltype: torch.optim.Adam(self.fusion_layers[ltype].parameters(), lr=1e-4)
+            ltype: torch.optim.Adam(self.fusion_layers[ltype].parameters(), lr=1e-5)
             for ltype in self.layer_types
         }
         
@@ -92,20 +92,32 @@ class Server(fedbase.BasicServer):
             proxy_batch = None
             
         if proxy_batch:
-            # 在计算元损失之前，我们需要将所有优化器的梯度清零
-            for optimizer in self.fusion_optimizers.values():
-                optimizer.zero_grad()
-            
-            loss_meta = self.calculator.compute_loss(w_candidate, proxy_batch)['loss']
-            
-            # loss_meta.backward() 会自动计算所有参与了前向传播的融合层的梯度
-            loss_meta.backward()
-            
-            # 更新所有优化器
-            for optimizer in self.fusion_optimizers.values():
-                optimizer.step()
+            # 定义元学习的训练步数
+            meta_train_steps = 10
+            for _ in range(meta_train_steps):
+                # 在循环内部重新获取一个随机的batch
+                # (如果数据集不大，也可以用同一个dataloader，它内部会shuffle)
+                try:
+                    meta_batch = next(iter(proxy_data_loader))
+                    meta_batch = self.calculator.to_device(meta_batch)
+                except StopIteration:
+                    # 如果数据用完了，就跳出循环
+                    break 
+
+                for optimizer in self.fusion_optimizers.values():
+                    optimizer.zero_grad()
                 
-            self.gv.logger.info(f"Fusion Meta Loss: {loss_meta.item():.4f}")
+                # 重新计算一次w_candidate在新的meta_batch上的损失
+                # 注意：w_candidate本身不更新，我们只是用它来产生梯度
+                loss_meta = self.calculator.compute_loss(w_candidate, meta_batch)['loss']
+                
+                loss_meta.backward()
+                
+                for optimizer in self.fusion_optimizers.values():
+                    optimizer.step()
+        
+        # 日志可以记录最后一次的loss
+        self.gv.logger.info(f"Fusion Meta Loss (last step): {loss_meta.item():.4f}")
         # ========================================================
 
         self.model.load_state_dict(w_candidate.state_dict(keep_vars=False))
