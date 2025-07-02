@@ -2,7 +2,7 @@ import copy, torch
 import torch.nn as nn 
 from flgo.algorithm import fedbase
 from flgo.utils import fmodule
-from models.fedformor_model import LightweightFusionLayer
+from models.fedformer_model import LightweightFusionLayer
 
 class Server(fedbase.BasicServer):
     def __init__(self, *args, **kwargs):
