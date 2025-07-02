@@ -10,11 +10,41 @@ class Server(fedbase.BasicServer):
         # K是参与聚合的客户端数量，我们需要提前知道或设定
         self.num_clients_per_round = int(len(self.clients)*self.proportion)
         
-        # 初始化轻量级融合层
-        self.fusion_layer = LightweightFusionLayer(self.num_clients_per_round).to(self.device)
+        # ================== 层类型感知的融合网络初始化 ==================
         
-        # 优化器现在只管理这个小小的fusion_layer的参数
-        self.fusion_optimizer = torch.optim.Adam(self.fusion_layer.parameters(), lr=1e-4)
+        # 定义层类型
+        self.layer_types = ['conv', 'bn', 'fc']
+        
+        # 使用 nn.ModuleDict 来管理三个独立的融合层
+        self.fusion_layers = nn.ModuleDict({
+            ltype: LightweightFusionLayer(self.num_clients_per_round).to(self.device)
+            for ltype in self.layer_types
+        })
+        
+        # 为每个融合层创建独立的优化器
+        # 也可以创建一个优化器管理所有参数，但独立管理更清晰
+        self.fusion_optimizers = {
+            ltype: torch.optim.Adam(self.fusion_layers[ltype].parameters(), lr=1e-4)
+            for ltype in self.layer_types
+        }
+        
+        # ==============================================================
+
+    def get_layer_type(self, layer_name: str) -> str:
+        """
+        根据层的名称判断其类型 (conv, bn, fc, or other)。
+        """
+        name = layer_name.lower()
+        if 'conv' in name:
+            return 'conv'
+        elif 'bn' in name or 'norm' in name:
+            return 'bn'
+        elif 'fc' in name or 'linear' in name or 'classifier' in name:
+            return 'fc'
+        else:
+            # 对于无法识别的层（如bias），我们可以默认使用一个通用的融合器，
+            # 或者为了简单起见，也归到'fc'里。这里我们归到'fc'。
+            return 'fc'
 
 
     def iterate(self):
@@ -26,48 +56,58 @@ class Server(fedbase.BasicServer):
         client_sequences, global_sequences = self.models_to_sequences(models)
 
         new_global_state_dict = self.model.state_dict()
-
+        
+        # ================== 层类型感知的融合循环 ==================
         for name in client_sequences.keys():
-            client_tensors = torch.stack(client_sequences[name]).to(self.device) # (K, D)
-            global_tensor = global_sequences[name].unsqueeze(0).to(self.device) # (1, D)
+            # 1. 判断当前层的类型
+            ltype = self.get_layer_type(name)
             
-            # 使用新的融合层
-            fused_token = self.fusion_layer(client_tensors, global_tensor) # (1, D)
+            # 2. 选择对应的融合层
+            fusion_layer = self.fusion_layers[ltype]
+
+            client_tensors = torch.stack(client_sequences[name]).to(self.device)
+            global_tensor = global_sequences[name].unsqueeze(0).to(self.device)
+            
+            # 3. 使用选定的融合层进行融合
+            fused_token = fusion_layer(client_tensors, global_tensor)
             
             original_shape = new_global_state_dict[name].shape
             new_global_state_dict[name] = fused_token.view(original_shape)
+        # ========================================================
 
         w_candidate = copy.deepcopy(self.model)
         w_candidate.load_state_dict(new_global_state_dict)
         w_candidate = w_candidate.to(self.device)
 
-        # 元学习部分
-        # 手动创建DataLoader来获取代理数据
+        # ================== 层类型感知的元学习 ==================
         proxy_data_loader = torch.utils.data.DataLoader(
-            self.test_data,
-            batch_size=64,
-            shuffle=True, 
+            self.test_data, batch_size=64, shuffle=True, 
             num_workers=self.option.get('num_workers', 0)
         )
 
         try:
-            # 从迭代器中获取一个批次
             proxy_batch = next(iter(proxy_data_loader))
-            # 将数据移动到正确的设备上
             proxy_batch = self.calculator.to_device(proxy_batch)
         except StopIteration:
-            self.gv.logger.warning("代理数据集(测试集)为空，本轮跳过融合网络训练。")
             proxy_batch = None
             
         if proxy_batch:
-            self.fusion_optimizer.zero_grad()
-            # 使用calculator计算损失
+            # 在计算元损失之前，我们需要将所有优化器的梯度清零
+            for optimizer in self.fusion_optimizers.values():
+                optimizer.zero_grad()
+            
             loss_meta = self.calculator.compute_loss(w_candidate, proxy_batch)['loss']
+            
+            # loss_meta.backward() 会自动计算所有参与了前向传播的融合层的梯度
             loss_meta.backward()
-            self.fusion_optimizer.step()
+            
+            # 更新所有优化器
+            for optimizer in self.fusion_optimizers.values():
+                optimizer.step()
+                
             self.gv.logger.info(f"Fusion Meta Loss: {loss_meta.item():.4f}")
+        # ========================================================
 
-        # 更新全局模型
         self.model.load_state_dict(w_candidate.state_dict(keep_vars=False))
         self.model = self.model.to(self.device)
         return True
